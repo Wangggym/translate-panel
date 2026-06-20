@@ -16,16 +16,18 @@ mkdir -p "$BIN" "$DATA" "$LAUNCH_AGENTS"
 if [ ! -f "$VENV/bin/python3" ]; then
     python3 -m venv "$VENV"
     "$VENV/bin/pip" install --quiet --upgrade pip
-    "$VENV/bin/pip" install --quiet pywebview
+    "$VENV/bin/pip" install --quiet pywebview "pyobjc>=10.0"
     echo "✓ venv created"
 else
     echo "✓ venv exists (skipped)"
 fi
 
 # Symlink app files — changes in repo take effect immediately, no reinstall needed
-ln -sf "$SCRIPT_DIR/app/daemon.py"      "$DATA/daemon.py"
-ln -sf "$SCRIPT_DIR/app/trigger.py"     "$DATA/trigger.py"
-ln -sf "$SCRIPT_DIR/app/translate.html" "$DATA/translate.html"
+ln -sf "$SCRIPT_DIR/app/daemon.py"  "$DATA/daemon.py"
+ln -sf "$SCRIPT_DIR/app/trigger.py" "$DATA/trigger.py"
+
+# Keep PopClip extension's trigger.py in sync with app/trigger.py
+cp "$SCRIPT_DIR/app/trigger.py" "$SCRIPT_DIR/popclip/TranslatePanel.popclipext/trigger.py"
 
 # CLI wrapper
 cat > "$BIN/translate-panel" << EOF

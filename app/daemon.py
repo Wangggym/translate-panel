@@ -41,7 +41,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler(os.path.join(DATA_DIR, "daemon.log")),
-        logging.StreamHandler(sys.stderr),
+        # StreamHandler removed: plist StandardErrorPath already captures stderr
+        # to daemon.log, causing every line to appear twice.
     ],
 )
 log = logging.getLogger("translate-panel")
@@ -130,40 +131,40 @@ def inject_text(text: str):
 # Audio stop: covers <audio>, <video>, speechSynthesis, and iframes
 # ---------------------------------------------------------------------------
 
-PAUSE_AUDIO_JS = """
+STOP_AUDIO_JS = """
 (function() {
+    // Click GT's own "Stop listening" button so GT's state machine stays consistent.
+    // This avoids WKWebView's pauseAllMediaPlayback which permanently blocks future playback.
+    var btn = Array.from(document.querySelectorAll('button')).find(function(b) {
+        var label = (b.getAttribute('aria-label') || '').toLowerCase();
+        return label.indexOf('stop') !== -1;
+    });
+    if (btn) { btn.click(); return 'clicked-stop: ' + btn.getAttribute('aria-label'); }
+
+    // Fallback: pause any DOM audio/video elements directly.
     var n = 0;
-    function pauseIn(doc) {
-        try {
-            doc.querySelectorAll('audio,video').forEach(function(m) {
-                m.pause(); m.currentTime = 0; n++;
-            });
-        } catch(e) {}
-        try {
-            Array.from(doc.querySelectorAll('iframe')).forEach(function(f) {
-                try { pauseIn(f.contentDocument); } catch(e) {}
-            });
-        } catch(e) {}
-    }
-    pauseIn(document);
-    if (window.speechSynthesis) { window.speechSynthesis.cancel(); n++; }
-    return n;
+    document.querySelectorAll('audio,video').forEach(function(m) {
+        m.pause(); m.currentTime = 0; n++;
+    });
+    return 'paused-dom: ' + n;
 })();
 """
 
 
 def pause_audio_then(callback):
-    """Pause all media (audio/video/speechSynthesis + iframes), then call callback()."""
+    """Stop GT audio by clicking its own Stop button (keeps GT state machine intact).
+    Falls back to pausing DOM audio elements. Does NOT use pauseAllMediaPlayback,
+    which permanently blocks future playback until setAllMediaPlaybackSuspended(false)."""
     log.debug("pause_audio_then: running")
 
     def on_done(result, error):
         if error:
             log.error("pause_audio JS error: %s", error)
         else:
-            log.info("pause_audio: stopped %s media element(s)", result)
+            log.info("pause_audio: %s", result)
         callback()
 
-    native_eval(PAUSE_AUDIO_JS, callback=on_done)
+    native_eval(STOP_AUDIO_JS, callback=on_done)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +176,27 @@ def handle_client(conn):
         data = b""
         while chunk := conn.recv(4096):
             data += chunk
-        text = json.loads(data.decode()).get("text", "")
+        payload = json.loads(data.decode())
+        action = payload.get("action")
+
+        if action == "eval":
+            # Test/debug: evaluate JS and return result synchronously.
+            code = payload.get("code", "")
+            log.info("handle_client: eval %.80s", code)
+            result_holder = [None, None]
+            done = threading.Event()
+
+            def on_eval(result, error):
+                result_holder[:] = [result, error]
+                done.set()
+
+            native_eval(code, callback=on_eval)
+            done.wait(timeout=5)
+            resp = json.dumps({"result": result_holder[0], "error": result_holder[1]})
+            conn.sendall(resp.encode())
+            return
+
+        text = payload.get("text", "")
         log.info("handle_client: received text=%.60s", text)
 
         _page_ready.wait(timeout=10)

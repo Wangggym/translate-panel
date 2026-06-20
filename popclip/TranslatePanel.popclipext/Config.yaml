@@ -1,7 +1,7 @@
 name: Translate Panel
 identifier: com.translatepanel.popclip
 description: Open selected text in a floating Google Translate panel
-icon: symbol:globe
+icon: symbol:character.bubble.fill
 actions:
 - title: Translate
   interpreter: python3

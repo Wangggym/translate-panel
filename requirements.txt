@@ -1,1 +1,2 @@
 pywebview>=4.4
+pyobjc>=10.0
