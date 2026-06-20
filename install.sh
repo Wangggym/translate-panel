@@ -18,8 +18,9 @@ python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet pywebview
 
 # Copy app files
-cp "$SCRIPT_DIR/app/daemon.py"  "$DATA/daemon.py"
-cp "$SCRIPT_DIR/app/trigger.py" "$DATA/trigger.py"
+cp "$SCRIPT_DIR/app/daemon.py"     "$DATA/daemon.py"
+cp "$SCRIPT_DIR/app/trigger.py"    "$DATA/trigger.py"
+cp "$SCRIPT_DIR/app/translate.html" "$DATA/translate.html"
 
 # CLI wrapper: `translate-panel "text"`
 cat > "$BIN/translate-panel" << EOF
