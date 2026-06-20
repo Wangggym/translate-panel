@@ -48,55 +48,6 @@ logging.basicConfig(
 log = logging.getLogger("translate-panel")
 
 
-# NSObject subclass must be at module level (pyobjc forbids re-defining ObjC classes)
-import objc
-from Foundation import NSObject
-
-# _afm_func must live at module scope — ctypes IMP pointer must not be GC'd
-_afm_func = None
-
-def _patch_wkwebview_first_mouse():
-    """Override WKWebView.acceptsFirstMouse: → YES via ObjC runtime (ctypes).
-
-    WKWebView inherits NSView's default (returns NO), so the first click on an
-    inactive window is consumed by focus. class_replaceMethod installs our YES
-    implementation directly on WKWebView. Must be called after WebKit is loaded
-    (i.e. from setup_appkit or on_loaded, not at import time)."""
-    global _afm_func
-    import ctypes
-
-    libobjc = ctypes.cdll.LoadLibrary('/usr/lib/libobjc.A.dylib')
-    libobjc.objc_getClass.restype = ctypes.c_void_p
-    libobjc.objc_getClass.argtypes = [ctypes.c_char_p]
-    libobjc.sel_registerName.restype = ctypes.c_void_p
-    libobjc.sel_registerName.argtypes = [ctypes.c_char_p]
-    libobjc.class_getInstanceMethod.restype = ctypes.c_void_p
-    libobjc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    libobjc.method_getTypeEncoding.restype = ctypes.c_char_p
-    libobjc.method_getTypeEncoding.argtypes = [ctypes.c_void_p]
-    libobjc.class_replaceMethod.restype = ctypes.c_void_p
-    libobjc.class_replaceMethod.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
-    ]
-
-    cls = libobjc.objc_getClass(b'WKWebView')
-    if not cls:
-        log.warning("_patch_wkwebview_first_mouse: WKWebView not in runtime")
-        return
-
-    sel = libobjc.sel_registerName(b'acceptsFirstMouse:')
-
-    # Get the type encoding from the inherited NSView method
-    method = libobjc.class_getInstanceMethod(cls, sel)
-    enc = libobjc.method_getTypeEncoding(method) if method else b'c@:@'
-
-    # IMP signature: (id self, SEL _cmd, NSEvent* event) -> BOOL
-    FuncType = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
-    _afm_func = FuncType(lambda self, _cmd, event: True)
-
-    libobjc.class_replaceMethod(cls, sel, _afm_func, enc)
-    log.info("WKWebView acceptsFirstMouse_ patched (enc=%s)", enc)
-
 # ---------------------------------------------------------------------------
 # pyobjc: find WKWebView
 # ---------------------------------------------------------------------------
@@ -253,7 +204,6 @@ def handle_client(conn):
         if _window:
             inject_text(text)
             _window.show()
-            _make_key_window()  # first click hits content, not just focuses window
             log.info("handle_client: window shown")
         else:
             log.warning("handle_client: _window is None")
@@ -300,30 +250,6 @@ def _resolve_wkwebview():
             log.debug("setPageZoom_ not available: %s", e)
 
 
-class _WindowActivator(NSObject):
-    """Dispatches activateIgnoringOtherApps_ + makeKeyAndOrderFront_ to the main thread."""
-
-    def activate_(self, _):
-        from AppKit import NSApplication
-        app = NSApplication.sharedApplication()
-        app.activateIgnoringOtherApps_(True)
-        for win in app.windows():
-            if win.isVisible():
-                win.makeKeyAndOrderFront_(None)
-        log.debug("activate_: done")
-
-_window_activator = None
-
-def _make_key_window():
-    """Call after _window.show() — belt-and-suspenders alongside acceptsFirstMouse_ patch."""
-    global _window_activator
-    if _window_activator is None:
-        _window_activator = _WindowActivator.alloc().init()
-    _window_activator.performSelectorOnMainThread_withObject_waitUntilDone_(
-        b'activate:', None, False
-    )
-
-
 def setup_appkit():
     """Called in background thread once pywebview's run loop is up."""
     try:
@@ -349,7 +275,6 @@ def setup_appkit():
             NSWindowDidResignKeyNotification, None, None, on_resign_key
         )
 
-        _patch_wkwebview_first_mouse()
         log.info("setup_appkit: done")
     except Exception as e:
         log.exception("setup_appkit error: %s", e)
