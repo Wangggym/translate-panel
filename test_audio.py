@@ -88,8 +88,26 @@ def fail(msg):
     sys.exit(1)
 
 
+def check_popclip_yaml():
+    """Validate PopClip extension YAML before testing the daemon."""
+    import yaml
+    here = os.path.dirname(os.path.abspath(__file__))
+    config = os.path.join(here, "popclip/TranslatePanel.popclipext/Config.yaml")
+    try:
+        with open(config) as f:
+            yaml.safe_load(f)
+        ok("Config.yaml is valid YAML")
+    except yaml.YAMLError as e:
+        fail(f"Config.yaml YAML error: {e}")
+    except FileNotFoundError:
+        fail(f"Config.yaml not found: {config}")
+
+
 def main():
     print("\n=== translate-panel audio flow test ===\n")
+
+    print("0. Validate PopClip extension")
+    check_popclip_yaml()
 
     # Step 1: show window with text
     print("1. Show window with 'hello world'")
