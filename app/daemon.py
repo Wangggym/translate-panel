@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-translate-panel daemon — Google Translate native UI with hash-based text injection.
+translate-panel daemon — Google Translate native UI, text injected via URL params.
 
-Why not pywebview.evaluate_js:
-  pywebview wraps code in JavaScript eval(), which is blocked by Google Translate's
-  Content Security Policy / Trusted Types. Instead we use pyobjc to call
-  WKWebView.evaluateJavaScript:completionHandler: directly (no eval wrapper).
+Injection strategy:
+  pywebview.evaluate_js uses JS eval() → blocked by Google Translate CSP/Trusted Types.
+  Instead, pyobjc calls WKWebView.evaluateJavaScript:completionHandler: directly.
 
-Injection flow:
-  1. Daemon pre-loads translate.google.com
-  2. On first load, we inject a WKUserScript (hashchange listener) via pyobjc's
-     WKUserContentController. This persists across subsequent page loads.
-  3. We also immediately inject the listener into the already-loaded page via
-     native evaluateJavaScript (no pywebview eval wrapper — bypasses CSP/TT).
-  4. On each trigger: native evaluateJavaScript sets window.location.hash = '#tp=TEXT'
-     → hashchange fires → listener injects text into textarea → GT translates.
-  5. Hash change does NOT reload the page.
+  Text is delivered by updating ?text= in the URL via history.replaceState, then
+  dispatching a popstate event. This works *with* Google Translate's own SPA router
+  (instead of fighting its state management via direct textarea injection, which
+  causes the "reverts to previous content" race condition).
 """
 import json
 import os
@@ -31,45 +25,19 @@ PID_FILE = os.path.join(DATA_DIR, "daemon.pid")
 BASE_URL = "https://translate.google.com/?sl=auto&tl=zh-CN&op=translate"
 
 _window = None
-_wkwebview = None          # native WKWebView, set after first load
+_wkwebview = None
 _page_ready = threading.Event()
-_listener_ready = threading.Event()
-
-# Injected via both WKUserScript (future loads) and native evaluateJavaScript
-# (current load). Uses no eval() — just property assignment + execCommand.
-HASH_LISTENER_JS = """
-(function() {
-    if (window.__tpListenerAdded) return;
-    window.__tpListenerAdded = true;
-
-    function injectFromHash() {
-        var hash = window.location.hash;
-        if (!hash.startsWith('#tp=')) return;
-        var text = decodeURIComponent(hash.slice(4));
-        // Clear hash without triggering another hashchange
-        history.replaceState(null, '', window.location.pathname + window.location.search);
-        var ta = document.querySelector('textarea');
-        if (!ta) { setTimeout(injectFromHash.bind(null, text), 150); return; }
-        ta.focus();
-        ta.select();
-        document.execCommand('insertText', false, text);
-    }
-
-    window.addEventListener('hashchange', injectFromHash);
-    injectFromHash();
-})();
-"""
 
 
 # ---------------------------------------------------------------------------
-# pyobjc helpers
+# pyobjc: find WKWebView
 # ---------------------------------------------------------------------------
 
 def find_wkwebview(view):
+    """Recurse view hierarchy; detect WKWebView by capability, not class name.
+    pywebview KVO-wraps WKWebView → class becomes NSKVONotifying_WebKitHost."""
     if view is None:
         return None
-    # pywebview KVO-wraps WKWebView → class name becomes NSKVONotifying_WebKitHost.
-    # Detect by capability (evaluateJavaScript:) rather than exact class name.
     if hasattr(view, "evaluateJavaScript_completionHandler_"):
         return view
     for sub in (view.subviews() or []):
@@ -88,74 +56,44 @@ def get_wkwebview():
     return None
 
 
-def native_eval(code: str, on_error=None):
-    """Call WKWebView.evaluateJavaScript: directly via pyobjc (no pywebview eval wrapper)."""
+def native_eval(code: str):
+    """Evaluate JS via native WKWebView API — no pywebview eval() wrapper, bypasses CSP."""
     global _wkwebview
     try:
         if not _wkwebview:
             _wkwebview = get_wkwebview()
         if not _wkwebview:
-            return
-
-        import objc
-
-        def handler(result, error):
-            if error and on_error:
-                on_error(str(error))
-
-        _wkwebview.evaluateJavaScript_completionHandler_(code, handler)
-    except Exception as e:
-        print(f"daemon: native_eval error: {e}", file=sys.stderr)
-
-
-def setup_hash_listener():
-    """Add hash listener to current page (native eval) + WKUserScript for future loads."""
-    global _wkwebview
-
-    try:
-        _wkwebview = get_wkwebview()
-        if not _wkwebview:
             print("daemon: WKWebView not found", file=sys.stderr)
             return
 
-        # 1. Add WKUserScript — runs on every subsequent page load (documentEnd)
-        from WebKit import WKUserScript
-        script = WKUserScript.alloc().initWithSource_injectionTime_forMainFrameOnly_(
-            HASH_LISTENER_JS,
-            1,   # WKUserScriptInjectionTimeAtDocumentEnd
-            True,
-        )
-        _wkwebview.configuration().userContentController().addUserScript_(script)
-
-        # 2. Inject into the already-loaded page via native evaluateJavaScript
-        def on_error(err):
-            print(f"daemon: listener injection error (CSP?): {err}", file=sys.stderr)
-            _listener_ready.set()  # still mark ready; we'll try hash anyway
-
-        def on_success(result, error):
+        def on_done(result, error):
             if error:
-                on_error(str(error))
-            else:
-                print("daemon: hash listener active in current page", file=sys.stderr)
-            _listener_ready.set()
+                print(f"daemon: native_eval error: {error}", file=sys.stderr)
 
-        _wkwebview.evaluateJavaScript_completionHandler_(HASH_LISTENER_JS, on_success)
-
+        _wkwebview.evaluateJavaScript_completionHandler_(code, on_done)
     except Exception as e:
-        print(f"daemon: setup_hash_listener error: {e}", file=sys.stderr)
-        _listener_ready.set()
+        print(f"daemon: native_eval exception: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Text injection
+# Text injection: URL params + popstate (works with GT's own SPA router)
 # ---------------------------------------------------------------------------
 
 def inject_text(text: str):
+    # URL-encode the text so embedding in JS string is safe for any input
     encoded = urllib.parse.quote(text, safe="")
-    native_eval(
-        f"window.location.hash = '#tp={encoded}'",
-        on_error=lambda e: print(f"daemon: hash inject error: {e}", file=sys.stderr),
-    )
+    native_eval(f"""
+(function() {{
+    var text = decodeURIComponent('{encoded}');
+    var url = new URL(window.location.href);
+    url.searchParams.set('sl', 'auto');
+    url.searchParams.set('tl', 'zh-CN');
+    url.searchParams.set('text', text);
+    url.searchParams.set('op', 'translate');
+    history.replaceState(null, '', url.toString());
+    window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
+}})();
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +106,7 @@ def handle_client(conn):
         while chunk := conn.recv(4096):
             data += chunk
         text = json.loads(data.decode()).get("text", "")
-
         _page_ready.wait(timeout=10)
-        _listener_ready.wait(timeout=5)
-
         if _window:
             inject_text(text)
             _window.show()
@@ -199,16 +134,22 @@ def socket_server():
 
 def on_loaded():
     _page_ready.set()
-    # Run in background — AppKit calls must be made carefully from non-main threads
-    threading.Thread(target=setup_hash_listener, daemon=True).start()
+    # Cache the WKWebView reference on first load (runs in pywebview's callback thread)
+    threading.Thread(target=lambda: _resolve_wkwebview(), daemon=True).start()
+
+
+def _resolve_wkwebview():
+    global _wkwebview
+    if not _wkwebview:
+        _wkwebview = get_wkwebview()
 
 
 def setup_appkit():
-    """Called in background thread after pywebview's run loop starts."""
+    """Called in background thread once pywebview's run loop is up."""
     try:
         from AppKit import NSApp, NSNotificationCenter, NSWindowDidResignKeyNotification
 
-        NSApp.setActivationPolicy_(1)  # no Dock icon
+        NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory — no Dock icon
 
         def on_resign_key(_notification):
             if _window:
