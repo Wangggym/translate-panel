@@ -7,11 +7,12 @@ Injection strategy:
   Instead, pyobjc calls WKWebView.evaluateJavaScript:completionHandler: directly.
 
   Text is delivered by updating ?text= in the URL via history.replaceState, then
-  dispatching a popstate event. This works *with* Google Translate's own SPA router
-  (instead of fighting its state management via direct textarea injection, which
-  causes the "reverts to previous content" race condition).
+  dispatching a popstate event. This works *with* Google Translate's own SPA router.
+
+Logs: ~/.local/share/translate-panel/daemon.log
 """
 import json
+import logging
 import os
 import socket
 import sys
@@ -27,6 +28,23 @@ BASE_URL = "https://translate.google.com/?sl=auto&tl=zh-CN&op=translate"
 _window = None
 _wkwebview = None
 _page_ready = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(os.path.join(DATA_DIR, "daemon.log")),
+        logging.StreamHandler(sys.stderr),
+    ],
+)
+log = logging.getLogger("translate-panel")
 
 
 # ---------------------------------------------------------------------------
@@ -52,27 +70,38 @@ def get_wkwebview():
     for win in NSApplication.sharedApplication().windows():
         hit = find_wkwebview(win.contentView())
         if hit:
+            log.debug("WKWebView found: %s", type(hit).__name__)
             return hit
+    log.warning("WKWebView not found in window hierarchy")
     return None
 
 
-def native_eval(code: str):
-    """Evaluate JS via native WKWebView API — no pywebview eval() wrapper, bypasses CSP."""
+def native_eval(code: str, callback=None):
+    """Evaluate JS via native WKWebView API — no pywebview eval() wrapper, bypasses CSP.
+    callback(result, error) is optional; errors are always logged."""
     global _wkwebview
     try:
         if not _wkwebview:
             _wkwebview = get_wkwebview()
         if not _wkwebview:
-            print("daemon: WKWebView not found", file=sys.stderr)
+            log.error("native_eval: WKWebView unavailable, skipping: %.80s", code)
+            if callback:
+                callback(None, "WKWebView not found")
             return
 
         def on_done(result, error):
             if error:
-                print(f"daemon: native_eval error: {error}", file=sys.stderr)
+                log.error("native_eval JS error: %s | code: %.80s", error, code)
+            else:
+                log.debug("native_eval ok, result=%s | code: %.80s", result, code)
+            if callback:
+                callback(result, error)
 
         _wkwebview.evaluateJavaScript_completionHandler_(code, on_done)
     except Exception as e:
-        print(f"daemon: native_eval exception: {e}", file=sys.stderr)
+        log.exception("native_eval exception: %s", e)
+        if callback:
+            callback(None, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +109,7 @@ def native_eval(code: str):
 # ---------------------------------------------------------------------------
 
 def inject_text(text: str):
-    # URL-encode the text so embedding in JS string is safe for any input
+    log.info("inject_text: %.60s", text)
     encoded = urllib.parse.quote(text, safe="")
     native_eval(f"""
 (function() {{
@@ -92,8 +121,49 @@ def inject_text(text: str):
     url.searchParams.set('op', 'translate');
     history.replaceState(null, '', url.toString());
     window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
+    return 'ok';
 }})();
 """)
+
+
+# ---------------------------------------------------------------------------
+# Audio stop: covers <audio>, <video>, speechSynthesis, and iframes
+# ---------------------------------------------------------------------------
+
+PAUSE_AUDIO_JS = """
+(function() {
+    var n = 0;
+    function pauseIn(doc) {
+        try {
+            doc.querySelectorAll('audio,video').forEach(function(m) {
+                m.pause(); m.currentTime = 0; n++;
+            });
+        } catch(e) {}
+        try {
+            Array.from(doc.querySelectorAll('iframe')).forEach(function(f) {
+                try { pauseIn(f.contentDocument); } catch(e) {}
+            });
+        } catch(e) {}
+    }
+    pauseIn(document);
+    if (window.speechSynthesis) { window.speechSynthesis.cancel(); n++; }
+    return n;
+})();
+"""
+
+
+def pause_audio_then(callback):
+    """Pause all media (audio/video/speechSynthesis + iframes), then call callback()."""
+    log.debug("pause_audio_then: running")
+
+    def on_done(result, error):
+        if error:
+            log.error("pause_audio JS error: %s", error)
+        else:
+            log.info("pause_audio: stopped %s media element(s)", result)
+        callback()
+
+    native_eval(PAUSE_AUDIO_JS, callback=on_done)
 
 
 # ---------------------------------------------------------------------------
@@ -106,12 +176,18 @@ def handle_client(conn):
         while chunk := conn.recv(4096):
             data += chunk
         text = json.loads(data.decode()).get("text", "")
+        log.info("handle_client: received text=%.60s", text)
+
         _page_ready.wait(timeout=10)
+
         if _window:
             inject_text(text)
             _window.show()
+            log.info("handle_client: window shown")
+        else:
+            log.warning("handle_client: _window is None")
     except Exception as e:
-        print(f"daemon: handle_client: {e}", file=sys.stderr)
+        log.exception("handle_client error: %s", e)
     finally:
         conn.close()
 
@@ -123,6 +199,7 @@ def socket_server():
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
         srv.bind(SOCKET_PATH)
         srv.listen(5)
+        log.info("socket server listening: %s", SOCKET_PATH)
         while True:
             conn, _ = srv.accept()
             threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
@@ -133,9 +210,9 @@ def socket_server():
 # ---------------------------------------------------------------------------
 
 def on_loaded():
+    log.info("on_loaded: page ready")
     _page_ready.set()
-    # Cache the WKWebView reference on first load (runs in pywebview's callback thread)
-    threading.Thread(target=lambda: _resolve_wkwebview(), daemon=True).start()
+    threading.Thread(target=_resolve_wkwebview, daemon=True).start()
 
 
 def _resolve_wkwebview():
@@ -150,30 +227,27 @@ def setup_appkit():
         from AppKit import NSApp, NSNotificationCenter, NSWindowDidResignKeyNotification
 
         NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory — no Dock icon
+        log.info("setup_appkit: Dock icon hidden, registering resign-key observer")
 
         def on_resign_key(_notification):
+            log.info("on_resign_key: window lost focus, pausing audio then hiding")
             if not _window:
+                log.warning("on_resign_key: _window is None")
                 return
-            global _wkwebview
-            if not _wkwebview:
-                _wkwebview = get_wkwebview()
-            if _wkwebview:
-                # Pause audio first; hide window in the completion handler so
-                # the JS actually runs before the WKWebView is taken offscreen.
-                def on_paused(result, error):
-                    _window.hide()
-                _wkwebview.evaluateJavaScript_completionHandler_(
-                    "document.querySelectorAll('audio,video').forEach(function(m){m.pause();m.currentTime=0;})",
-                    on_paused,
-                )
-            else:
+            # Pause audio first; hide only after JS completes so WKWebView is
+            # still onscreen when evaluateJavaScript runs.
+            def do_hide():
                 _window.hide()
+                log.info("on_resign_key: window hidden")
+
+            pause_audio_then(do_hide)
 
         NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
             NSWindowDidResignKeyNotification, None, None, on_resign_key
         )
+        log.info("setup_appkit: done")
     except Exception as e:
-        print(f"daemon: AppKit setup error: {e}", file=sys.stderr)
+        log.exception("setup_appkit error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +261,8 @@ def main():
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
+    log.info("daemon starting, pid=%d", os.getpid())
+
     threading.Thread(target=socket_server, daemon=True).start()
 
     _window = webview.create_window(
@@ -198,9 +274,11 @@ def main():
         hidden=True,
     )
     _window.events.loaded += on_loaded
+    log.info("webview window created, starting GUI loop")
 
     webview.start(func=setup_appkit)
 
+    log.info("daemon exiting")
     for path in (PID_FILE, SOCKET_PATH):
         try:
             os.unlink(path)
