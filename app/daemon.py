@@ -153,6 +153,7 @@ def setup_appkit():
 
         def on_resign_key(_notification):
             if _window:
+                native_eval("document.querySelectorAll('audio,video').forEach(function(m){m.pause();m.currentTime=0;})")
                 _window.hide()
 
         NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
