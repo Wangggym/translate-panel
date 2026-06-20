@@ -48,6 +48,9 @@ logging.basicConfig(
 log = logging.getLogger("translate-panel")
 
 
+# NSObject subclass must be at module level (pyobjc forbids re-defining ObjC classes)
+from Foundation import NSObject
+
 # ---------------------------------------------------------------------------
 # pyobjc: find WKWebView
 # ---------------------------------------------------------------------------
@@ -204,6 +207,7 @@ def handle_client(conn):
         if _window:
             inject_text(text)
             _window.show()
+            _make_key_window()  # first click hits content, not just focuses window
             log.info("handle_client: window shown")
         else:
             log.warning("handle_client: _window is None")
@@ -230,6 +234,8 @@ def socket_server():
 # pywebview callbacks
 # ---------------------------------------------------------------------------
 
+PAGE_ZOOM = 0.7  # scale factor for Google Translate content
+
 def on_loaded():
     log.info("on_loaded: page ready")
     _page_ready.set()
@@ -240,6 +246,51 @@ def _resolve_wkwebview():
     global _wkwebview
     if not _wkwebview:
         _wkwebview = get_wkwebview()
+    if _wkwebview:
+        try:
+            _wkwebview.setPageZoom_(PAGE_ZOOM)
+            log.debug("page zoom set to %.2f", PAGE_ZOOM)
+        except Exception as e:
+            log.debug("setPageZoom_ not available: %s", e)
+
+
+class _WindowActivator(NSObject):
+    """Activates the translate panel on the main thread.
+
+    Timing: PopClip dismisses *after* trigger.py exits and may return focus to the
+    source app. We schedule the actual activation 350ms after show() so we grab
+    focus after PopClip finishes, not before."""
+
+    def scheduleActivate_(self, _):
+        from Foundation import NSTimer
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.35, self, b'activate:', None, False
+        )
+
+    def activate_(self, _):
+        from AppKit import NSApplication
+        app = NSApplication.sharedApplication()
+        app.activateIgnoringOtherApps_(True)
+        activated = 0
+        for win in app.windows():
+            if win.isVisible():
+                win.makeKeyAndOrderFront_(None)
+                activated += 1
+        # Log isKeyWindow so we can verify the fix in tests
+        key_states = [win.isKeyWindow() for win in app.windows() if win.isVisible()]
+        log.info("activate_: done, makeKeyAndOrderFront on %d window(s), isKeyWindow=%s", activated, key_states)
+
+_window_activator = None
+
+def _make_key_window():
+    """Schedule delayed activation so it fires after PopClip dismisses."""
+    global _window_activator
+    if _window_activator is None:
+        _window_activator = _WindowActivator.alloc().init()
+    # fire-and-forget; actual activation runs 0.35s later on the main thread
+    _window_activator.performSelectorOnMainThread_withObject_waitUntilDone_(
+        b'scheduleActivate:', None, False
+    )
 
 
 def setup_appkit():
