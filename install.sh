@@ -12,24 +12,29 @@ echo "→ Installing translate-panel..."
 
 mkdir -p "$BIN" "$DATA" "$LAUNCH_AGENTS"
 
-# Venv + dependencies
-python3 -m venv "$VENV"
-"$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet pywebview
+# Venv + pywebview (one-time; skip if already installed)
+if [ ! -f "$VENV/bin/python3" ]; then
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet pywebview
+    echo "✓ venv created"
+else
+    echo "✓ venv exists (skipped)"
+fi
 
-# Copy app files
-cp "$SCRIPT_DIR/app/daemon.py"     "$DATA/daemon.py"
-cp "$SCRIPT_DIR/app/trigger.py"    "$DATA/trigger.py"
-cp "$SCRIPT_DIR/app/translate.html" "$DATA/translate.html"
+# Symlink app files — changes in repo take effect immediately, no reinstall needed
+ln -sf "$SCRIPT_DIR/app/daemon.py"      "$DATA/daemon.py"
+ln -sf "$SCRIPT_DIR/app/trigger.py"     "$DATA/trigger.py"
+ln -sf "$SCRIPT_DIR/app/translate.html" "$DATA/translate.html"
 
-# CLI wrapper: `translate-panel "text"`
+# CLI wrapper
 cat > "$BIN/translate-panel" << EOF
 #!/bin/bash
-"$VENV/bin/python3" "$DATA/trigger.py" "\$@"
+python3 "$DATA/trigger.py" "\$@"
 EOF
 chmod +x "$BIN/translate-panel"
 
-# Launch agent — keeps daemon alive across reboots
+# Launch agent (daemon auto-starts at login, launchd restarts on crash)
 cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,8 +60,11 @@ EOF
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
 
-echo "✓ translate-panel installed to $BIN/translate-panel"
-echo "✓ daemon registered as launch agent (auto-starts at login)"
+echo "✓ symlinks: $DATA/{daemon,trigger}.py → $SCRIPT_DIR/app/"
+echo "✓ daemon registered as launch agent"
 echo ""
-echo "Install the PopClip extension:"
+echo "After code changes: just kill the daemon, launchd restarts it automatically."
+echo "  pkill -f daemon.py"
+echo ""
+echo "Install the PopClip extension (one-time):"
 echo "  Double-click: $SCRIPT_DIR/popclip/TranslatePanel.popclipext"
