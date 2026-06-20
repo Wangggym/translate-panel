@@ -152,8 +152,21 @@ def setup_appkit():
         NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory — no Dock icon
 
         def on_resign_key(_notification):
-            if _window:
-                native_eval("document.querySelectorAll('audio,video').forEach(function(m){m.pause();m.currentTime=0;})")
+            if not _window:
+                return
+            global _wkwebview
+            if not _wkwebview:
+                _wkwebview = get_wkwebview()
+            if _wkwebview:
+                # Pause audio first; hide window in the completion handler so
+                # the JS actually runs before the WKWebView is taken offscreen.
+                def on_paused(result, error):
+                    _window.hide()
+                _wkwebview.evaluateJavaScript_completionHandler_(
+                    "document.querySelectorAll('audio,video').forEach(function(m){m.pause();m.currentTime=0;})",
+                    on_paused,
+                )
+            else:
                 _window.hide()
 
         NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
