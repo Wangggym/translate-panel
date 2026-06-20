@@ -1,12 +1,19 @@
 # translate-panel
 
-A macOS floating translation panel — select text with [PopClip](https://www.popclip.app/), click the globe icon, and a Google Translate panel pops up inline without opening a new browser tab.
+A macOS floating Google Translate panel for [PopClip](https://www.popclip.app/) — select text, click the globe, a panel appears inline without opening a browser tab.
 
 ## How it works
 
-- PopClip triggers a shell script with the selected text
-- A small floating window (pywebview / WebKit) opens `translate.google.com` with the text pre-filled
-- The panel stays on top of other windows; close it when done
+```
+PopClip → trigger.py ──socket──▶ daemon.py (persistent)
+                                      │
+                                   WebKit window (pre-warmed)
+                                   shows / hides on demand
+```
+
+- A daemon keeps a **pre-warmed WebKit window** in the background, so the panel appears instantly.
+- The window is **floating** (`on_top`) and **auto-hides** when you click back into any other app.
+- PopClip's loading spinner stops as soon as trigger.py sends the text — not when the window closes.
 
 ## Requirements
 
@@ -23,14 +30,22 @@ chmod +x install.sh
 
 Then double-click `popclip/TranslatePanel.popclipext` to install the PopClip extension.
 
+The install script registers a **launch agent** so the daemon starts at login and is always ready.
+
 ## Usage
 
-1. Select any text in any app
-2. PopClip bar appears — click the **globe** icon
-3. A 720×520 floating panel opens with the translation
+Select any text → PopClip → **globe icon** → floating translation panel appears.
 
-## Manual usage (without PopClip)
+Click anywhere outside the panel to dismiss it.
+
+## Manual usage
 
 ```bash
 translate-panel "hello world"
+```
+
+## Logs
+
+```bash
+tail -f ~/.local/share/translate-panel/daemon.log
 ```
