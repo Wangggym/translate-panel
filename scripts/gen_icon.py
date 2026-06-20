@@ -9,7 +9,7 @@ BG = (66, 133, 244)  # Google blue #4285f4
 
 img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
-d.rounded_rectangle([0, 0, SIZE - 1, SIZE - 1], radius=RADIUS, fill=BG)
+# Transparent background — PopClip applies its own rounded rect via color: in Config.yaml
 
 for fp in [
     "/System/Library/Fonts/PingFang.ttc",
