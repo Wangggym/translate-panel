@@ -49,7 +49,53 @@ log = logging.getLogger("translate-panel")
 
 
 # NSObject subclass must be at module level (pyobjc forbids re-defining ObjC classes)
+import objc
 from Foundation import NSObject
+
+# _afm_func must live at module scope — ctypes IMP pointer must not be GC'd
+_afm_func = None
+
+def _patch_wkwebview_first_mouse():
+    """Override WKWebView.acceptsFirstMouse: → YES via ObjC runtime (ctypes).
+
+    WKWebView inherits NSView's default (returns NO), so the first click on an
+    inactive window is consumed by focus. class_replaceMethod installs our YES
+    implementation directly on WKWebView. Must be called after WebKit is loaded
+    (i.e. from setup_appkit or on_loaded, not at import time)."""
+    global _afm_func
+    import ctypes
+
+    libobjc = ctypes.cdll.LoadLibrary('/usr/lib/libobjc.A.dylib')
+    libobjc.objc_getClass.restype = ctypes.c_void_p
+    libobjc.objc_getClass.argtypes = [ctypes.c_char_p]
+    libobjc.sel_registerName.restype = ctypes.c_void_p
+    libobjc.sel_registerName.argtypes = [ctypes.c_char_p]
+    libobjc.class_getInstanceMethod.restype = ctypes.c_void_p
+    libobjc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    libobjc.method_getTypeEncoding.restype = ctypes.c_char_p
+    libobjc.method_getTypeEncoding.argtypes = [ctypes.c_void_p]
+    libobjc.class_replaceMethod.restype = ctypes.c_void_p
+    libobjc.class_replaceMethod.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+    ]
+
+    cls = libobjc.objc_getClass(b'WKWebView')
+    if not cls:
+        log.warning("_patch_wkwebview_first_mouse: WKWebView not in runtime")
+        return
+
+    sel = libobjc.sel_registerName(b'acceptsFirstMouse:')
+
+    # Get the type encoding from the inherited NSView method
+    method = libobjc.class_getInstanceMethod(cls, sel)
+    enc = libobjc.method_getTypeEncoding(method) if method else b'c@:@'
+
+    # IMP signature: (id self, SEL _cmd, NSEvent* event) -> BOOL
+    FuncType = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    _afm_func = FuncType(lambda self, _cmd, event: True)
+
+    libobjc.class_replaceMethod(cls, sel, _afm_func, enc)
+    log.info("WKWebView acceptsFirstMouse_ patched (enc=%s)", enc)
 
 # ---------------------------------------------------------------------------
 # pyobjc: find WKWebView
@@ -255,41 +301,26 @@ def _resolve_wkwebview():
 
 
 class _WindowActivator(NSObject):
-    """Activates the translate panel on the main thread.
-
-    Timing: PopClip dismisses *after* trigger.py exits and may return focus to the
-    source app. We schedule the actual activation 350ms after show() so we grab
-    focus after PopClip finishes, not before."""
-
-    def scheduleActivate_(self, _):
-        from Foundation import NSTimer
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.35, self, b'activate:', None, False
-        )
+    """Dispatches activateIgnoringOtherApps_ + makeKeyAndOrderFront_ to the main thread."""
 
     def activate_(self, _):
         from AppKit import NSApplication
         app = NSApplication.sharedApplication()
         app.activateIgnoringOtherApps_(True)
-        activated = 0
         for win in app.windows():
             if win.isVisible():
                 win.makeKeyAndOrderFront_(None)
-                activated += 1
-        # Log isKeyWindow so we can verify the fix in tests
-        key_states = [win.isKeyWindow() for win in app.windows() if win.isVisible()]
-        log.info("activate_: done, makeKeyAndOrderFront on %d window(s), isKeyWindow=%s", activated, key_states)
+        log.debug("activate_: done")
 
 _window_activator = None
 
 def _make_key_window():
-    """Schedule delayed activation so it fires after PopClip dismisses."""
+    """Call after _window.show() — belt-and-suspenders alongside acceptsFirstMouse_ patch."""
     global _window_activator
     if _window_activator is None:
         _window_activator = _WindowActivator.alloc().init()
-    # fire-and-forget; actual activation runs 0.35s later on the main thread
     _window_activator.performSelectorOnMainThread_withObject_waitUntilDone_(
-        b'scheduleActivate:', None, False
+        b'activate:', None, False
     )
 
 
@@ -317,6 +348,8 @@ def setup_appkit():
         NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
             NSWindowDidResignKeyNotification, None, None, on_resign_key
         )
+
+        _patch_wkwebview_first_mouse()
         log.info("setup_appkit: done")
     except Exception as e:
         log.exception("setup_appkit error: %s", e)
