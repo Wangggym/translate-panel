@@ -361,6 +361,26 @@ def setup_appkit():
             except Exception as exc:
                 log.debug("hotkey handler error: %s", exc)
 
+        # Global monitor requires Accessibility permission.
+        # Without it the monitor registers but never fires in other apps.
+        import ctypes
+        _ax = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        _ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        if _ax.AXIsProcessTrusted():
+            log.info("setup_appkit: Accessibility permission granted")
+        else:
+            log.warning("setup_appkit: Accessibility not granted — opening System Settings")
+            from AppKit import NSWorkspace
+            from Foundation import NSURL
+            NSWorkspace.sharedWorkspace().openURL_(
+                NSURL.URLWithString_(
+                    "x-apple.systempreferences:com.apple.preference.security"
+                    "?Privacy_Accessibility"
+                )
+            )
+
         _hotkey_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             NSEventMaskKeyDown, on_key
         )
