@@ -124,15 +124,20 @@ def inject_text(text: str):
     url.searchParams.set('text', text);
     url.searchParams.set('op', 'translate');
     history.replaceState(null, '', url.toString());
-    window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
-    // GT's SPA router may not be ready on first open; only retry if the
-    // textarea is still empty 600ms later (avoids restarting a live translation).
-    setTimeout(function() {{
-        var ta = document.querySelector('textarea');
-        if (ta && ta.value.trim().length === 0) {{
-            window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
+    // GT's SPA router may not be ready on cold start; retry every 500ms
+    // until the textarea is populated (max 6 attempts = 3 s total).
+    var _attempts = 0;
+    function _dispatch() {{
+        window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
+        _attempts++;
+        if (_attempts < 6) {{
+            setTimeout(function() {{
+                var ta = document.querySelector('textarea');
+                if (!ta || ta.value.trim().length === 0) {{ _dispatch(); }}
+            }}, 500);
         }}
-    }}, 600);
+    }}
+    _dispatch();
     return 'ok';
 }})();
 """)
