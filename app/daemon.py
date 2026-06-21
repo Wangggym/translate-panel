@@ -28,6 +28,9 @@ BASE_URL = "https://translate.google.com/?sl=auto&tl=zh-CN&op=translate"
 _window = None
 _wkwebview = None
 _page_ready = threading.Event()
+_status_item = None    # NSStatusItem — kept alive as module-level ref
+_click_handler = None  # ObjC target for status bar click
+_hotkey_monitor = None # NSEvent global monitor token
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -238,7 +241,7 @@ def socket_server():
 # pywebview callbacks
 # ---------------------------------------------------------------------------
 
-PAGE_ZOOM = 0.7  # scale factor for Google Translate content
+PAGE_ZOOM = 0.85  # scale factor for Google Translate content
 
 def on_loaded():
     log.info("on_loaded: page ready")
@@ -258,10 +261,64 @@ def _resolve_wkwebview():
             log.debug("setPageZoom_ not available: %s", e)
 
 
+def _show_panel():
+    """Show the panel and bring it to front."""
+    if _window:
+        _window.show()
+        log.info("_show_panel: panel shown")
+
+
+# ---------------------------------------------------------------------------
+# AppKit setup — status bar icon + global hotkey
+# ---------------------------------------------------------------------------
+
+def _install_status_item():
+    """Create NSStatusItem on the main thread."""
+    global _status_item, _click_handler
+    try:
+        from Foundation import NSObject
+        from AppKit import NSStatusBar, NSVariableStatusItemLength, NSImage
+
+        class _ClickHandler(NSObject):
+            def click_(self, sender):
+                log.info("status bar clicked: showing panel")
+                _show_panel()
+
+        _click_handler = _ClickHandler.alloc().init()
+        _status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        btn = _status_item.button()
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "character.bubble", "Show Translate Panel"
+        )
+        if img is None:
+            _status_item.setTitle_("译")
+            log.warning("_install_status_item: SF Symbol unavailable, using text label")
+        else:
+            img.setTemplate_(True)
+            btn.setImage_(img)
+        btn.setTarget_(_click_handler)
+        btn.setAction_("click:")
+        log.info("_install_status_item: status bar icon installed")
+    except Exception as e:
+        log.exception("_install_status_item error: %s", e)
+
+
+class _StatusItemInstaller(object):
+    """Tiny helper to dispatch status item creation to the main thread via PyObjC."""
+    pass
+
+
 def setup_appkit():
     """Called in background thread once pywebview's run loop is up."""
+    global _hotkey_monitor
     try:
-        from AppKit import NSApp, NSNotificationCenter, NSWindowDidResignKeyNotification
+        from Foundation import NSObject
+        from AppKit import (
+            NSApp, NSNotificationCenter, NSWindowDidResignKeyNotification,
+            NSEvent, NSEventMaskKeyDown,
+            NSEventModifierFlagOption, NSEventModifierFlagCommand,
+            NSEventModifierFlagControl, NSEventModifierFlagShift,
+        )
 
         NSApp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory — no Dock icon
         log.info("setup_appkit: Dock icon hidden, registering resign-key observer")
@@ -271,17 +328,43 @@ def setup_appkit():
             if not _window:
                 log.warning("on_resign_key: _window is None")
                 return
-            # Pause audio first; hide only after JS completes so WKWebView is
-            # still onscreen when evaluateJavaScript runs.
             def do_hide():
                 _window.hide()
                 log.info("on_resign_key: window hidden")
-
             pause_audio_then(do_hide)
 
         NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
             NSWindowDidResignKeyNotification, None, None, on_resign_key
         )
+
+        # NSStatusItem must be created on the main thread.
+        class _Dispatcher(NSObject):
+            def install_(self, _):
+                _install_status_item()
+
+        dispatcher = _Dispatcher.alloc().init()
+        dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_("install:", None, False)
+
+        # --- Global hotkey: ⌥T (Option+T, no other modifiers) ---
+        KEY_T = 17
+        MODIFIERS_MASK = (
+            NSEventModifierFlagOption | NSEventModifierFlagCommand |
+            NSEventModifierFlagControl | NSEventModifierFlagShift
+        )
+
+        def on_key(event):
+            try:
+                if (event.keyCode() == KEY_T and
+                        (event.modifierFlags() & MODIFIERS_MASK) == NSEventModifierFlagOption):
+                    log.info("hotkey ⌥T: showing panel")
+                    _show_panel()
+            except Exception as exc:
+                log.debug("hotkey handler error: %s", exc)
+
+        _hotkey_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskKeyDown, on_key
+        )
+        log.info("setup_appkit: global hotkey ⌥T registered")
 
         log.info("setup_appkit: done")
     except Exception as e:
