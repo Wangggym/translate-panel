@@ -124,20 +124,18 @@ def inject_text(text: str):
     url.searchParams.set('text', text);
     url.searchParams.set('op', 'translate');
     history.replaceState(null, '', url.toString());
-    // GT's SPA router may not be ready on cold start; retry every 500ms
-    // until the textarea is populated (max 6 attempts = 3 s total).
-    var _attempts = 0;
-    function _dispatch() {{
-        window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
-        _attempts++;
-        if (_attempts < 6) {{
-            setTimeout(function() {{
-                var ta = document.querySelector('textarea');
-                if (!ta || ta.value.trim().length === 0) {{ _dispatch(); }}
-            }}, 500);
+    // Wait for GT's Angular app to bootstrap (textarea appears), then dispatch
+    // popstate ONCE. Checking textarea.value is wrong — Angular binding is async
+    // and the value appears empty even while a translation is in flight, causing
+    // repeated dispatches that cancel and restart GT's fetch loop.
+    var _tick = 0;
+    (function _waitAndDispatch() {{
+        if (document.querySelector('textarea')) {{
+            window.dispatchEvent(new PopStateEvent('popstate', {{state: null}}));
+        }} else if (_tick++ < 20) {{
+            setTimeout(_waitAndDispatch, 250);  // max 5 s wait
         }}
-    }}
-    _dispatch();
+    }})();
     return 'ok';
 }})();
 """)
